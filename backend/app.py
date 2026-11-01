@@ -1,0 +1,784 @@
+from __future__ import annotations
+
+import base64
+import hashlib
+import hmac
+import io
+import json
+import os
+import random
+import sqlite3
+import time
+import urllib.request
+import uuid
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, Optional
+
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.staticfiles import StaticFiles
+from PIL import Image, ImageOps
+from pydantic import BaseModel, Field
+
+from .db import (
+    IS_VERCEL,
+    MEDIA_DIR,
+    PUBLIC_DIR,
+    connect,
+    init_db,
+    now_iso,
+    serialize_task,
+    using_postgres,
+)
+from .recommender import INTENTS, recommend
+
+STATIC_DIR = PUBLIC_DIR / "static"
+MAX_PHOTO_BYTES = 3 * 1024 * 1024
+BLOB_TOKEN = os.getenv("BLOB_READ_WRITE_TOKEN", "").strip()
+APP_PASSWORD = os.getenv("APP_PASSWORD", "").strip()
+SESSION_SECRET = os.getenv("SESSION_SECRET", "").strip() or APP_PASSWORD or "yibai-local-dev"
+SESSION_COOKIE = "yibai_session"
+SESSION_MAX_AGE = 30 * 24 * 60 * 60
+AUTH_REQUIRED = bool(APP_PASSWORD) or IS_VERCEL
+PHOTO_COLORS = ["#D8A47F", "#B8C6B0", "#A9C4D4", "#D6A5A0", "#C7A5A0", "#A8ADA4"]
+PUBLIC_API_PATHS = {"/api/health", "/api/session", "/api/login", "/api/logout"}
+
+if not IS_VERCEL:
+    MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+
+app = FastAPI(title="一百个今天 MVP")
+if STATIC_DIR.exists():
+    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+if MEDIA_DIR.exists():
+    app.mount("/media", StaticFiles(directory=str(MEDIA_DIR)), name="media")
+
+
+def _session_token() -> str:
+    stamp = str(int(time.time()))
+    signature = hmac.new(
+        SESSION_SECRET.encode("utf-8"), stamp.encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+    return f"{stamp}.{signature}"
+
+
+def _session_valid(token: Optional[str]) -> bool:
+    if not token or "." not in token:
+        return False
+    stamp, signature = token.split(".", 1)
+    if not stamp.isdigit():
+        return False
+    if int(time.time()) - int(stamp) > SESSION_MAX_AGE:
+        return False
+    expected = hmac.new(
+        SESSION_SECRET.encode("utf-8"), stamp.encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(signature, expected)
+
+
+@app.middleware("http")
+async def protect_private_api(request: Request, call_next):
+    path = request.url.path
+    if path.startswith("/api/") and path not in PUBLIC_API_PATHS:
+        if AUTH_REQUIRED and not _session_valid(request.cookies.get(SESSION_COOKIE)):
+            return JSONResponse(
+                {"detail": "需要先输入访问密码"}, status_code=401
+            )
+    return await call_next(request)
+
+
+class LoginRequest(BaseModel):
+    password: str = Field(default="", max_length=200)
+
+
+class ProfileUpdate(BaseModel):
+    name: str = Field(default="你", max_length=24)
+    target_count: int = Field(default=100, ge=1, le=1000)
+    duration_days: int = Field(default=365, ge=0, le=36500)
+
+
+class SelectRequest(BaseModel):
+    task_id: int
+    version: str = "standard"
+    intent: str = ""
+    reason: str = ""
+
+
+class CompleteRequest(BaseModel):
+    user_task_id: int
+    note: str = Field(default="", max_length=1200)
+    photo_data: Optional[str] = None
+    mood_after: Optional[int] = Field(default=None, ge=1, le=5)
+    color: str = Field(default="#D8A47F", max_length=16)
+    repeat_wish: bool = False
+    is_private: bool = True
+    energy: int = Field(default=3, ge=1, le=5)
+
+
+class CheckinRequest(BaseModel):
+    intent: str
+    energy: int = Field(default=3, ge=1, le=5)
+
+
+class CustomTaskRequest(BaseModel):
+    title: str = Field(min_length=1, max_length=60)
+    summary: str = Field(default="", max_length=160)
+    category: str = Field(default="自定义", max_length=20)
+    minutes_standard: int = Field(default=15, ge=1, le=600)
+
+
+@app.on_event("startup")
+def startup() -> None:
+    init_db()
+
+
+@app.get("/")
+def index() -> FileResponse:
+    return FileResponse(PUBLIC_DIR / "index.html")
+
+
+@app.get("/favicon.ico")
+def favicon() -> Response:
+    return Response(status_code=204)
+
+
+@app.get("/robots.txt")
+def robots() -> FileResponse:
+    return FileResponse(PUBLIC_DIR / "robots.txt", media_type="text/plain")
+
+
+@app.get("/api/session")
+def session(request: Request) -> dict:
+    return {
+        "auth_required": AUTH_REQUIRED,
+        "authenticated": (not AUTH_REQUIRED)
+        or _session_valid(request.cookies.get(SESSION_COOKIE)),
+        "configured": bool(APP_PASSWORD) if AUTH_REQUIRED else True,
+    }
+
+
+@app.post("/api/login")
+def login(payload: LoginRequest, response: Response) -> dict:
+    if not APP_PASSWORD:
+        if IS_VERCEL:
+            raise HTTPException(
+                status_code=503,
+                detail="访问密码尚未配置：请在 Vercel 环境变量中设置 APP_PASSWORD。",
+            )
+        return {"ok": True}
+    if not hmac.compare_digest(payload.password, APP_PASSWORD):
+        raise HTTPException(status_code=401, detail="密码不正确，再试一次吧。")
+    response.set_cookie(
+        SESSION_COOKIE,
+        _session_token(),
+        max_age=SESSION_MAX_AGE,
+        httponly=True,
+        secure=IS_VERCEL,
+        samesite="lax",
+        path="/",
+    )
+    return {"ok": True}
+
+
+@app.post("/api/logout")
+def logout(response: Response) -> dict:
+    response.delete_cookie(SESSION_COOKIE, path="/")
+    return {"ok": True}
+
+
+@app.get("/api/health")
+def health() -> dict:
+    conn = connect()
+    try:
+        count = conn.execute("SELECT COUNT(*) AS n FROM tasks").fetchone()["n"]
+        return {
+            "ok": True,
+            "tasks": count,
+            "storage": "postgres" if using_postgres() else "sqlite",
+            "blob": bool(BLOB_TOKEN),
+            "auth_required": AUTH_REQUIRED,
+            "auth_configured": bool(APP_PASSWORD) if AUTH_REQUIRED else True,
+        }
+    finally:
+        conn.close()
+
+
+def _profile(conn: Any) -> dict:
+    row = conn.execute("SELECT * FROM profile WHERE id = 1").fetchone()
+    return {
+        "name": row["name"],
+        "target_count": row["target_count"],
+        "duration_days": row["duration_days"],
+        "created_at": row["created_at"],
+    }
+
+
+def _active(conn: Any) -> Optional[dict]:
+    row = conn.execute(
+        """
+        SELECT ut.id AS user_task_id, ut.version, ut.intent, ut.reason, ut.selected_at, t.*
+        FROM user_tasks ut
+        JOIN tasks t ON t.id = ut.task_id
+        WHERE ut.status = 'active'
+        ORDER BY ut.id DESC LIMIT 1
+        """
+    ).fetchone()
+    if not row:
+        return None
+    task = serialize_task(row)
+    return {
+        "user_task_id": row["user_task_id"],
+        "version": row["version"],
+        "intent": row["intent"],
+        "reason": row["reason"],
+        "selected_at": row["selected_at"],
+        "task": task,
+    }
+
+
+def _photo_url(photo_path: Optional[str]) -> Optional[str]:
+    if not photo_path:
+        return None
+    if photo_path.startswith(("http://", "https://")):
+        return photo_path
+    return f"/media/{photo_path}"
+
+
+def _memory_from_row(row: sqlite3.Row) -> dict:
+    task = serialize_task(row)
+    return {
+        "entry_id": row["entry_id"],
+        "user_task_id": row["user_task_id"],
+        "task": task,
+        "note": row["note"] or "",
+        "photo_url": _photo_url(row["photo_path"]),
+        "mood_after": row["mood_after"],
+        "color": row["entry_color"] or task["color"],
+        "repeat_wish": bool(row["repeat_wish"]),
+        "is_private": bool(row["is_private"]),
+        "completed_at": row["completed_at"],
+        "created_at": row["entry_created_at"],
+    }
+
+
+def _memories(conn: Any, limit: Optional[int] = None) -> list[dict]:
+    sql = """
+        SELECT ut.id AS user_task_id, ut.completed_at, t.*,
+               e.id AS entry_id, e.note, e.photo_path, e.mood_after,
+               e.color AS entry_color, e.repeat_wish, e.is_private,
+               e.created_at AS entry_created_at
+        FROM user_tasks ut
+        JOIN tasks t ON t.id = ut.task_id
+        JOIN entries e ON e.user_task_id = ut.id
+        WHERE ut.status = 'completed'
+        ORDER BY ut.completed_at DESC
+    """
+    params = []
+    if limit:
+        sql += " LIMIT ?"
+        params.append(limit)
+    rows = conn.execute(sql, params).fetchall()
+    return [_memory_from_row(row) for row in rows]
+
+
+def _stats(conn: Any) -> dict:
+    profile = _profile(conn)
+    completed = conn.execute(
+        "SELECT COUNT(*) AS n FROM user_tasks WHERE status = 'completed'"
+    ).fetchone()["n"]
+    categories = conn.execute(
+        """
+        SELECT t.category, COUNT(*) AS n
+        FROM user_tasks ut JOIN tasks t ON t.id = ut.task_id
+        WHERE ut.status = 'completed'
+        GROUP BY t.category ORDER BY n DESC
+        """
+    ).fetchall()
+    return {
+        "completed": completed,
+        "target": profile["target_count"],
+        "remaining": max(profile["target_count"] - completed, 0),
+        "categories": [{"name": row["category"], "count": row["n"]} for row in categories],
+    }
+
+
+def _last_intent(conn: Any) -> str:
+    row = conn.execute(
+        """
+        SELECT intent FROM user_tasks
+        WHERE status = 'completed' AND intent IS NOT NULL AND intent != ''
+        ORDER BY completed_at DESC LIMIT 1
+        """
+    ).fetchone()
+    return row["intent"] if row else ""
+
+
+@app.get("/api/bootstrap")
+def bootstrap() -> dict:
+    conn = connect()
+    try:
+        active = _active(conn)
+        stats = _stats(conn)
+        recent = _memories(conn, limit=4)
+        intent = active["intent"] if active else _last_intent(conn)
+        exclude = {active["task"]["id"]} if active else set()
+        suggestions = recommend(conn, intent=intent, energy=3, limit=3, exclude_ids=exclude)
+        return {
+            "profile": _profile(conn),
+            "active": active,
+            "stats": stats,
+            "memories": recent,
+            "intents": INTENTS,
+            "suggestions": suggestions,
+        }
+    finally:
+        conn.close()
+
+
+@app.get("/api/tasks")
+def tasks(
+    intent: str = Query(default=""),
+    energy: int = Query(default=3, ge=1, le=5),
+    limit: int = Query(default=8, ge=1, le=24),
+    refresh: int = Query(default=0),
+    exclude: str = Query(default=""),
+) -> dict:
+    conn = connect()
+    try:
+        seed = int(datetime.now().timestamp() * 1000) if refresh else None
+        exclude_ids = {
+            int(part.strip())
+            for part in exclude.split(",")
+            if part.strip().isdigit()
+        }
+        items = recommend(
+            conn,
+            intent=intent,
+            energy=energy,
+            limit=limit,
+            seed=seed,
+            exclude_ids=exclude_ids,
+        )
+        return {"tasks": items, "intent": intent, "energy": energy}
+    finally:
+        conn.close()
+
+
+@app.get("/api/tasks/{task_id}")
+def task_detail(task_id: int) -> dict:
+    conn = connect()
+    try:
+        row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="没有找到这件事")
+        return serialize_task(row)
+    finally:
+        conn.close()
+
+
+@app.post("/api/select")
+def select_task(payload: SelectRequest) -> dict:
+    if payload.version not in {"min", "standard", "adventure"}:
+        raise HTTPException(status_code=400, detail="版本不正确")
+    conn = connect()
+    try:
+        task = conn.execute("SELECT * FROM tasks WHERE id = ?", (payload.task_id,)).fetchone()
+        if not task:
+            raise HTTPException(status_code=404, detail="没有找到这件事")
+        conn.execute(
+            "UPDATE user_tasks SET status = 'released' WHERE status = 'active'"
+        )
+        conn.execute(
+            """
+            INSERT INTO user_tasks (task_id, version, intent, reason, status, selected_at)
+            VALUES (?, ?, ?, ?, 'active', ?)
+            """,
+            (payload.task_id, payload.version, payload.intent, payload.reason or "", now_iso()),
+        )
+        conn.commit()
+        active = _active(conn)
+        return {"active": active}
+    finally:
+        conn.close()
+
+
+def _safe_recommend(
+    conn: Any, intent: str, energy: int, exclude_ids: set[int]
+) -> list[dict]:
+    try:
+        return recommend(conn, intent=intent, energy=energy, limit=3, exclude_ids=exclude_ids)
+    except Exception:
+        return []
+
+
+@app.post("/api/complete")
+def complete_task(payload: CompleteRequest) -> dict:
+    conn = connect()
+    try:
+        row = conn.execute(
+            """
+            SELECT ut.*, t.title FROM user_tasks ut
+            JOIN tasks t ON t.id = ut.task_id
+            WHERE ut.id = ?
+            """,
+            (payload.user_task_id,),
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="没有找到这次记录")
+        if row["status"] == "completed":
+            existing = conn.execute(
+                """
+                SELECT ut.id AS user_task_id, ut.completed_at, t.*,
+                       e.id AS entry_id, e.note, e.photo_path, e.mood_after,
+                       e.color AS entry_color, e.repeat_wish, e.is_private,
+                       e.created_at AS entry_created_at
+                FROM user_tasks ut
+                JOIN tasks t ON t.id = ut.task_id
+                JOIN entries e ON e.user_task_id = ut.id
+                WHERE ut.id = ?
+                """,
+                (payload.user_task_id,),
+            ).fetchone()
+            if existing:
+                return {
+                    "memory": _memory_from_row(existing),
+                    "recommendations": _safe_recommend(
+                        conn, row["intent"] or "", payload.energy, {row["task_id"]}
+                    ),
+                    "stats": _stats(conn),
+                }
+            raise HTTPException(status_code=400, detail="这件事已经记录过了")
+        if row["status"] != "active":
+            raise HTTPException(status_code=400, detail="这件事已经记录过了")
+
+        photo_path = _save_photo(payload.photo_data) if payload.photo_data else None
+        completed_at = now_iso()
+        conn.execute(
+            """
+            UPDATE user_tasks SET status = 'completed', completed_at = ? WHERE id = ?
+            """,
+            (completed_at, payload.user_task_id),
+        )
+        conn.execute(
+            """
+            INSERT INTO entries (
+                user_task_id, note, photo_path, mood_after, color,
+                repeat_wish, is_private, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_task_id) DO UPDATE SET
+                note = excluded.note,
+                photo_path = COALESCE(excluded.photo_path, entries.photo_path),
+                mood_after = excluded.mood_after,
+                color = excluded.color,
+                repeat_wish = excluded.repeat_wish,
+                is_private = excluded.is_private,
+                created_at = excluded.created_at
+            """,
+            (
+                payload.user_task_id,
+                payload.note.strip(),
+                photo_path,
+                payload.mood_after,
+                payload.color or "#D8A47F",
+                1 if payload.repeat_wish else 0,
+                1 if payload.is_private else 0,
+                completed_at,
+            ),
+        )
+        conn.commit()
+
+        memory_row = conn.execute(
+            """
+            SELECT ut.id AS user_task_id, ut.completed_at, t.*,
+                   e.id AS entry_id, e.note, e.photo_path, e.mood_after,
+                   e.color AS entry_color, e.repeat_wish, e.is_private,
+                   e.created_at AS entry_created_at
+            FROM user_tasks ut
+            JOIN tasks t ON t.id = ut.task_id
+            JOIN entries e ON e.user_task_id = ut.id
+            WHERE ut.id = ?
+            """,
+            (payload.user_task_id,),
+        ).fetchone()
+        memory = _memory_from_row(memory_row)
+        recommendations = _safe_recommend(
+            conn, row["intent"] or "", payload.energy, {row["task_id"]}
+        )
+        return {
+            "memory": memory,
+            "recommendations": recommendations,
+            "stats": _stats(conn),
+        }
+    finally:
+        conn.close()
+
+
+@app.post("/api/skip/{user_task_id}")
+def skip_task(user_task_id: int) -> dict:
+    conn = connect()
+    try:
+        row = conn.execute(
+            "SELECT * FROM user_tasks WHERE id = ? AND status = 'active'",
+            (user_task_id,),
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="没有找到正在进行的这件事")
+        conn.execute("UPDATE user_tasks SET status = 'skipped' WHERE id = ?", (user_task_id,))
+        conn.commit()
+        items = recommend(conn, intent=row["intent"] or "", energy=3, limit=3)
+        return {"recommendations": items}
+    finally:
+        conn.close()
+
+
+@app.post("/api/checkin")
+def checkin(payload: CheckinRequest) -> dict:
+    conn = connect()
+    try:
+        conn.execute(
+            "INSERT INTO checkins (intent, energy, created_at) VALUES (?, ?, ?)",
+            (payload.intent, payload.energy, now_iso()),
+        )
+        conn.commit()
+        return {
+            "ok": True,
+            "suggestions": recommend(
+                conn, intent=payload.intent, energy=payload.energy, limit=3
+            ),
+        }
+    finally:
+        conn.close()
+
+
+@app.post("/api/profile")
+def update_profile(payload: ProfileUpdate) -> dict:
+    conn = connect()
+    try:
+        conn.execute(
+            "UPDATE profile SET name = ?, target_count = ?, duration_days = ? WHERE id = 1",
+            (payload.name.strip() or "你", payload.target_count, payload.duration_days),
+        )
+        conn.commit()
+        return {"profile": _profile(conn), "stats": _stats(conn)}
+    finally:
+        conn.close()
+
+
+@app.post("/api/custom-task")
+def create_custom_task(payload: CustomTaskRequest) -> dict:
+    conn = connect()
+    try:
+        minutes = payload.minutes_standard
+        title = payload.title.strip()
+        summary = payload.summary.strip() or "一件由你自己写下的小事。"
+        category = payload.category.strip() or "自定义"
+        slug = f"custom-{uuid.uuid4().hex[:12]}"
+        min_minutes = max(1, min(5, minutes // 3 or 1))
+        min_action = f"先花 {min_minutes} 分钟，做一个最小的开始"
+        adventure_action = f"给这件事留出 {max(minutes * 2, 30)} 分钟，做得更完整一点"
+        color = random.choice(PHOTO_COLORS)
+        conn.execute(
+            """
+            INSERT INTO tasks (
+                slug, title, summary, category, tags,
+                minutes_min, minutes_standard, minutes_adventure,
+                social, place, cost, difficulty, color,
+                min_action, standard_action, adventure_action, prompt, is_custom, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'any', 'anywhere', 0, 1, ?, ?, ?, ?, ?, 1, ?)
+            """,
+            (
+                slug,
+                title,
+                summary,
+                category,
+                json.dumps(["custom", "self"], ensure_ascii=False),
+                min_minutes,
+                minutes,
+                max(minutes * 2, 30),
+                color,
+                min_action,
+                summary,
+                adventure_action,
+                "做完之后，你想留下什么？",
+                now_iso(),
+            ),
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM tasks WHERE slug = ?", (slug,)).fetchone()
+        return {"task": serialize_task(row)}
+    finally:
+        conn.close()
+
+
+@app.get("/api/memories")
+def memories(limit: int = Query(default=200, ge=1, le=500)) -> dict:
+    conn = connect()
+    try:
+        return {"memories": _memories(conn, limit=limit)}
+    finally:
+        conn.close()
+
+
+@app.post("/api/demo/seed")
+def seed_demo() -> dict:
+    conn = connect()
+    try:
+        existing = conn.execute(
+            "SELECT COUNT(*) AS n FROM user_tasks WHERE status = 'completed'"
+        ).fetchone()["n"]
+        if existing:
+            return {"seeded": False, "memories": _memories(conn)}
+
+        demo = [
+            ("window-ten", 3, "今天云很厚，楼下有人在收衣服。", 4, "#B8C6B0", 1, "quiet"),
+            ("look-at-sky", 5, "天蓝得很安静。", 4, "#A9C4D4", 0, "outside"),
+            ("one-song-dark", 7, "听到副歌的时候，突然没那么想解释了。", 5, "#9FA8B8", 1, "quiet"),
+            ("tidy-bedside", 9, "只整理了床头，但房间像轻了一点。", 3, "#C8BFAF", 0, "achieve"),
+            ("share-a-song", 12, "朋友回了我一个笑脸。", 4, "#C5A4B0", 1, "connect"),
+        ]
+        for slug, days_ago, note, mood, color, repeat, intent in demo:
+            task = conn.execute("SELECT * FROM tasks WHERE slug = ?", (slug,)).fetchone()
+            if not task:
+                continue
+            stamp = datetime.now(timezone.utc) - timedelta(days=days_ago, hours=days_ago)
+            insert_sql = """
+                INSERT INTO user_tasks (task_id, version, intent, reason, status, selected_at, completed_at)
+                VALUES (?, 'standard', ?, '示例记忆', 'completed', ?, ?)
+            """
+            params = (task["id"], intent, stamp.isoformat(), stamp.isoformat())
+            if using_postgres():
+                user_task_id = conn.execute(
+                    insert_sql + " RETURNING id", params
+                ).fetchone()["id"]
+            else:
+                user_task_id = conn.execute(insert_sql, params).lastrowid
+            conn.execute(
+                """
+                INSERT INTO entries (user_task_id, note, photo_path, mood_after, color, repeat_wish, is_private, created_at)
+                VALUES (?, ?, NULL, ?, ?, ?, 1, ?)
+                """,
+                (user_task_id, note, mood, color, repeat, stamp.isoformat()),
+            )
+        conn.commit()
+        return {"seeded": True, "memories": _memories(conn)}
+    finally:
+        conn.close()
+
+
+@app.post("/api/demo/reset")
+def reset_demo() -> dict:
+    conn = connect()
+    try:
+        photo_rows = conn.execute(
+            "SELECT photo_path FROM entries WHERE photo_path IS NOT NULL"
+        ).fetchall()
+        remote_urls = [
+            row["photo_path"]
+            for row in photo_rows
+            if str(row["photo_path"]).startswith(("http://", "https://"))
+        ]
+        conn.execute("DELETE FROM entries")
+        conn.execute("DELETE FROM user_tasks")
+        conn.execute("DELETE FROM checkins")
+        conn.execute("DELETE FROM tasks WHERE is_custom = 1")
+        conn.execute(
+            "UPDATE profile SET name = '你', target_count = 100, duration_days = 365 WHERE id = 1"
+        )
+        conn.commit()
+        if MEDIA_DIR.exists():
+            for path in MEDIA_DIR.glob("*.jpg"):
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+        if remote_urls:
+            _delete_blobs(remote_urls)
+        return {"ok": True}
+    finally:
+        conn.close()
+
+
+def _save_photo(data_url: str) -> str:
+    if not data_url.startswith("data:image/"):
+        raise HTTPException(status_code=400, detail="请上传图片文件")
+    try:
+        header, encoded = data_url.split(",", 1)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="图片格式不正确") from exc
+    if not header:
+        raise HTTPException(status_code=400, detail="图片格式不正确")
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="图片内容无法读取") from exc
+    if len(raw) > MAX_PHOTO_BYTES:
+        raise HTTPException(status_code=413, detail="图片超过 3MB，请换一张小一点的")
+    try:
+        image = Image.open(io.BytesIO(raw))
+        image = ImageOps.exif_transpose(image)
+        image.thumbnail((1600, 1600))
+        image = image.convert("RGB")
+        output = io.BytesIO()
+        image.save(output, format="JPEG", quality=82, optimize=True)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="这张图片暂时无法处理，请换一张试试") from exc
+
+    if BLOB_TOKEN:
+        return _upload_to_blob(output.getvalue())
+    if IS_VERCEL:
+        raise HTTPException(
+            status_code=500,
+            detail="图片存储未配置：请在 Vercel 项目里连接 Blob，并注入 BLOB_READ_WRITE_TOKEN。",
+        )
+    MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+    filename = f"{uuid.uuid4().hex}.jpg"
+    (MEDIA_DIR / filename).write_bytes(output.getvalue())
+    return filename
+
+
+def _delete_blobs(urls: list[str]) -> None:
+    if not BLOB_TOKEN:
+        return
+    request = urllib.request.Request(
+        "https://blob.vercel-storage.com/delete",
+        data=json.dumps({"urls": urls}).encode("utf-8"),
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {BLOB_TOKEN}",
+            "Content-Type": "application/json",
+            "x-api-version": "7",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=15):
+            pass
+    except Exception:
+        return
+
+
+def _upload_to_blob(data: bytes) -> str:
+    pathname = f"yibai/{uuid.uuid4().hex}.jpg"
+    request = urllib.request.Request(
+        f"https://blob.vercel-storage.com/{pathname}",
+        data=data,
+        method="PUT",
+        headers={
+            "Authorization": f"Bearer {BLOB_TOKEN}",
+            "x-content-type": "image/jpeg",
+            "x-add-random-suffix": "1",
+            "x-cache-control-max-age": "31536000",
+            "x-api-version": "7",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=25) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="照片暂时没能上传到 Blob，请稍后再试。",
+        ) from exc
+    url = payload.get("url")
+    if not url:
+        raise HTTPException(status_code=502, detail="Blob 没有返回图片地址，请稍后再试。")
+    return url

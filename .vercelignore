@@ -1,0 +1,12 @@
+data/
+media/
+__pycache__/
+*.pyc
+.DS_Store
+work/
+static
+.env
+.env.*
+!.env.example
+.vercel/
+*.log

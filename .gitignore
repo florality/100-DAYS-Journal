@@ -8,5 +8,5 @@ __pycache__/
 *.log
 data/
 media/
-static
+/static
 work/

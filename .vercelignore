@@ -4,7 +4,7 @@ __pycache__/
 *.pyc
 .DS_Store
 work/
-static
+/static
 .env
 .env.*
 !.env.example

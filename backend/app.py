@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import io
 import json
+import logging
 import os
 import random
 import sqlite3
@@ -43,6 +44,9 @@ SESSION_MAX_AGE = 30 * 24 * 60 * 60
 AUTH_REQUIRED = bool(APP_PASSWORD) or IS_VERCEL
 PHOTO_COLORS = ["#D8A47F", "#B8C6B0", "#A9C4D4", "#D6A5A0", "#C7A5A0", "#A8ADA4"]
 PUBLIC_API_PATHS = {"/api/health", "/api/session", "/api/login", "/api/logout"}
+STARTUP_ERROR: Optional[str] = None
+
+logger = logging.getLogger("yibai")
 
 if not IS_VERCEL:
     MEDIA_DIR.mkdir(parents=True, exist_ok=True)
@@ -129,7 +133,35 @@ class CustomTaskRequest(BaseModel):
 
 @app.on_event("startup")
 def startup() -> None:
-    init_db()
+    global STARTUP_ERROR
+    STARTUP_ERROR = None
+    try:
+        init_db()
+    except Exception as exc:
+        STARTUP_ERROR = _friendly_database_error(exc)
+        logger.exception("数据库初始化失败")
+
+
+def _friendly_database_error(exc: Exception) -> str:
+    message = str(exc)
+    if "DATABASE_URL" in message:
+        return "线上数据库尚未配置：请在 Vercel 连接 Postgres，并确认 DATABASE_URL 已加入 Production 环境。"
+    if "psycopg" in message:
+        return "线上数据库驱动加载失败，请检查 Vercel 构建日志和 requirements.txt。"
+    if "timeout" in message.lower() or "timed out" in message.lower():
+        return "数据库连接超时，请检查 Postgres 是否暂停或连接串是否正确。"
+    return "数据库暂时连接不上，请检查 DATABASE_URL 和 Postgres 运行状态。"
+
+
+@app.exception_handler(Exception)
+async def handle_unexpected_error(request: Request, exc: Exception) -> JSONResponse:
+    logger.exception("请求处理失败：%s", request.url.path)
+    if STARTUP_ERROR:
+        return JSONResponse(status_code=503, content={"detail": STARTUP_ERROR})
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "服务暂时不可用，请稍后再试。"},
+    )
 
 
 @app.get("/")
@@ -187,20 +219,29 @@ def logout(response: Response) -> dict:
 
 
 @app.get("/api/health")
-def health() -> dict:
-    conn = connect()
+def health(response: Response) -> dict:
+    result = {
+        "ok": True,
+        "storage": "postgres" if using_postgres() else ("unconfigured" if IS_VERCEL else "sqlite"),
+        "blob": bool(BLOB_TOKEN),
+        "auth_required": AUTH_REQUIRED,
+        "auth_configured": bool(APP_PASSWORD) if AUTH_REQUIRED else True,
+    }
+    if STARTUP_ERROR:
+        response.status_code = 503
+        return {**result, "ok": False, "error": STARTUP_ERROR}
+    conn = None
     try:
+        conn = connect()
         count = conn.execute("SELECT COUNT(*) AS n FROM tasks").fetchone()["n"]
-        return {
-            "ok": True,
-            "tasks": count,
-            "storage": "postgres" if using_postgres() else "sqlite",
-            "blob": bool(BLOB_TOKEN),
-            "auth_required": AUTH_REQUIRED,
-            "auth_configured": bool(APP_PASSWORD) if AUTH_REQUIRED else True,
-        }
+        return {**result, "tasks": count}
+    except Exception as exc:
+        logger.exception("健康检查失败")
+        response.status_code = 503
+        return {**result, "ok": False, "error": _friendly_database_error(exc)}
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
 
 
 def _profile(conn: Any) -> dict:

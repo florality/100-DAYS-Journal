@@ -10,6 +10,7 @@ import os
 import random
 import sqlite3
 import time
+import urllib.error
 import urllib.request
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -37,6 +38,15 @@ from .recommender import INTENTS, recommend
 STATIC_DIR = PUBLIC_DIR / "static"
 MAX_PHOTO_BYTES = 3 * 1024 * 1024
 BLOB_TOKEN = os.getenv("BLOB_READ_WRITE_TOKEN", "").strip()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_BASE_URL = (
+    os.getenv("OPENAI_BASE_URL", "https://api.siliconflow.cn/v1").strip().rstrip("/")
+    or "https://api.siliconflow.cn/v1"
+)
+OPENAI_MODEL = (
+    os.getenv("OPENAI_MODEL", "deepseek-ai/DeepSeek-V4-Flash").strip()
+    or "deepseek-ai/DeepSeek-V4-Flash"
+)
 APP_PASSWORD = os.getenv("APP_PASSWORD", "").strip()
 SESSION_SECRET = os.getenv("SESSION_SECRET", "").strip() or APP_PASSWORD or "yibai-local-dev"
 SESSION_COOKIE = "yibai_session"
@@ -129,6 +139,67 @@ class CustomTaskRequest(BaseModel):
     summary: str = Field(default="", max_length=160)
     category: str = Field(default="自定义", max_length=20)
     minutes_standard: int = Field(default=15, ge=1, le=600)
+
+
+class AIInspirationRequest(BaseModel):
+    intent: str = Field(default="", max_length=24)
+    energy: int = Field(default=3, ge=1, le=5)
+    minutes: int = Field(default=10, ge=1, le=180)
+    count: int = Field(default=3, ge=1, le=5)
+
+
+AI_CATEGORIES = ["安静", "身体", "创造", "观察", "城市", "连接", "照顾", "勇气"]
+AI_TASK_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "title": {"type": "string"},
+        "summary": {"type": "string"},
+        "category": {"type": "string", "enum": AI_CATEGORIES},
+        "minutes_min": {"type": "integer"},
+        "minutes_standard": {"type": "integer"},
+        "minutes_adventure": {"type": "integer"},
+        "min_action": {"type": "string"},
+        "standard_action": {"type": "string"},
+        "adventure_action": {"type": "string"},
+        "prompt": {"type": "string"},
+        "color": {"type": "string"},
+        "social": {"type": "string", "enum": ["solo", "any", "together"]},
+        "place": {"type": "string", "enum": ["anywhere", "home", "outside"]},
+        "cost": {"type": "integer", "enum": [0, 1]},
+        "difficulty": {"type": "integer", "enum": [1, 2, 3]},
+    },
+    "required": [
+        "title",
+        "summary",
+        "category",
+        "minutes_min",
+        "minutes_standard",
+        "minutes_adventure",
+        "min_action",
+        "standard_action",
+        "adventure_action",
+        "prompt",
+        "color",
+        "social",
+        "place",
+        "cost",
+        "difficulty",
+    ],
+    "additionalProperties": False,
+}
+AI_TASK_BATCH_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "tasks": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 5,
+            "items": AI_TASK_SCHEMA,
+        }
+    },
+    "required": ["tasks"],
+    "additionalProperties": False,
+}
 
 
 @app.on_event("startup")
@@ -224,6 +295,7 @@ def health(response: Response) -> dict:
         "ok": True,
         "storage": "postgres" if using_postgres() else ("unconfigured" if IS_VERCEL else "sqlite"),
         "blob": bool(BLOB_TOKEN),
+        "ai": bool(OPENAI_API_KEY),
         "auth_required": AUTH_REQUIRED,
         "auth_configured": bool(APP_PASSWORD) if AUTH_REQUIRED else True,
     }
@@ -650,6 +722,312 @@ def create_custom_task(payload: CustomTaskRequest) -> dict:
     finally:
         conn.close()
 
+
+
+def _short_text(value: Any, limit: int, fallback: str) -> str:
+    text = " ".join(str(value or "").split())
+    return text[:limit] or fallback
+
+
+def _clamp_int(value: Any, low: int, high: int, fallback: int) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        number = fallback
+    return max(low, min(high, number))
+
+
+def _ai_liked_categories(conn: Any) -> list[str]:
+    try:
+        rows = conn.execute(
+            """
+            SELECT t.category, e.mood_after, e.repeat_wish
+            FROM user_tasks ut
+            JOIN tasks t ON t.id = ut.task_id
+            LEFT JOIN entries e ON e.user_task_id = ut.id
+            WHERE ut.status = 'completed'
+            ORDER BY ut.completed_at DESC
+            LIMIT 12
+            """
+        ).fetchall()
+    except Exception:
+        return []
+    liked = []
+    for row in rows:
+        if (row["mood_after"] or 0) >= 4 or row["repeat_wish"]:
+            category = row["category"]
+            if category not in liked:
+                liked.append(category)
+    return liked[:4]
+
+
+def _parse_json_text(text: str) -> dict:
+    value = (text or "").strip()
+    if value.startswith("```"):
+        lines = value.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        value = "\n".join(lines).strip()
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        start = value.find("{")
+        end = value.rfind("}")
+        if start >= 0 and end > start:
+            return json.loads(value[start : end + 1])
+        raise
+
+
+def _extract_chat_text(data: dict) -> str:
+    choices = data.get("choices") or []
+    if not choices:
+        raise RuntimeError("AI 返回内容为空")
+    message = choices[0].get("message") or {}
+    content = message.get("content")
+    if isinstance(content, str) and content.strip():
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict) and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+        if parts:
+            return "\n".join(parts)
+    raise RuntimeError("AI 返回内容为空")
+
+
+def _post_chat_completion(messages: list[dict], with_response_format: bool) -> dict:
+    request_body: dict[str, Any] = {
+        "model": OPENAI_MODEL,
+        "messages": messages,
+        "temperature": 0.85,
+        "max_tokens": 2200,
+        "stream": False,
+    }
+    if with_response_format:
+        request_body["response_format"] = {"type": "json_object"}
+    request = urllib.request.Request(
+        f"{OPENAI_BASE_URL}/chat/completions",
+        data=json.dumps(request_body, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=40) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        if with_response_format and exc.code in {400, 404, 422}:
+            return _post_chat_completion(messages, with_response_format=False)
+        body = exc.read().decode("utf-8", errors="replace")[:800]
+        raise RuntimeError(f"AI 接口返回 {exc.code}: {body}") from exc
+
+
+def _generate_ai_batch(
+    intent: str,
+    energy: int,
+    minutes: int,
+    count: int,
+    existing_titles: list[str],
+    liked_categories: list[str],
+) -> list[dict]:
+    intent_meta = next((item for item in INTENTS if item["id"] == intent), None)
+    intent_label = intent_meta["label"] if intent_meta else "没有特别偏好"
+    avoid = "、".join(existing_titles[:90]) or "无"
+    liked = "、".join(liked_categories) or "还没有明显偏好"
+    instructions = (
+        "你是一个温柔、克制的生活灵感助手，为心情低落或孤单的年轻用户设计"
+        "可以独自完成的真实小事。不要使用治疗、诊断、疗愈承诺或强迫积极的语言，"
+        "不要建议危险、违法、饮酒、用药、陌生人见面或高消费活动。任务必须具体、低门槛、"
+        "可以随时停止。只输出一个合法 JSON 对象，不要输出解释、Markdown 或代码块。"
+    )
+    user_prompt = f"""
+为“一百个今天”生成 {count} 件适合现在做的小事。
+
+用户此刻的意图：{intent_label}
+今天的电量：{energy}/5（1 很累，5 还不错）
+这一次可以留出的时间：约 {minutes} 分钟
+用户过去感觉不错的类别：{liked}
+已有任务，不要重复或近似改写：{avoid}
+
+每个任务都要有：
+- 18 个汉字以内的标题，和一句不超过 45 个汉字的说明
+- 最小版、标准版、冒险版三个动作；最小版必须几乎立刻能开始
+- 一个记录时可以使用的问题
+- 合理的时间、社交方式、地点、花费和难度
+- 颜色使用柔和的十六进制色值，例如 #B8C6B0
+
+优先给出安静、身体、观察、照顾、创造类的小事。不要每次都给“喝水、散步、写日记”这种泛泛建议，
+要有一点具体场景和画面感，但不要复杂。
+
+必须严格符合下面的 JSON Schema，只返回 JSON：
+{json.dumps(AI_TASK_BATCH_SCHEMA, ensure_ascii=False)}
+"""
+    messages = [
+        {"role": "system", "content": instructions},
+        {"role": "user", "content": user_prompt},
+    ]
+    data = _post_chat_completion(messages, with_response_format=True)
+    content = _parse_json_text(_extract_chat_text(data))
+    tasks = content.get("tasks")
+    if not isinstance(tasks, list):
+        raise RuntimeError("AI 没有返回任务列表")
+    return tasks[:count]
+
+def _clean_ai_task(raw: dict, intent: str, requested_minutes: int) -> dict:
+    standard = _clamp_int(
+        raw.get("minutes_standard"), 1, 180, max(5, min(requested_minutes, 90))
+    )
+    minimum = _clamp_int(raw.get("minutes_min"), 1, standard, min(5, standard))
+    adventure = _clamp_int(
+        raw.get("minutes_adventure"), standard, 240, max(standard + 10, standard * 2)
+    )
+    if adventure <= standard:
+        adventure = min(240, standard + 5)
+    category = raw.get("category")
+    if category not in AI_CATEGORIES:
+        category = "安静"
+    social = raw.get("social")
+    if social not in {"solo", "any", "together"}:
+        social = "solo"
+    place = raw.get("place")
+    if place not in {"anywhere", "home", "outside"}:
+        place = "anywhere"
+    color = str(raw.get("color") or "").strip()
+    if not (color.startswith("#") and len(color) in {4, 7}):
+        color = random.choice(PHOTO_COLORS)
+    return {
+        "title": _short_text(raw.get("title"), 36, "今天的一件小事"),
+        "summary": _short_text(raw.get("summary"), 110, "一件可以让今天松一点的小事。"),
+        "category": category,
+        "tags": ["ai", intent or "quiet", category],
+        "minutes": [minimum, standard, adventure],
+        "social": social,
+        "place": place,
+        "cost": 1 if _clamp_int(raw.get("cost"), 0, 1, 0) else 0,
+        "difficulty": _clamp_int(raw.get("difficulty"), 1, 3, 1),
+        "color": color,
+        "actions": [
+            _short_text(raw.get("min_action"), 90, "先做一个最小的开始"),
+            _short_text(raw.get("standard_action"), 120, "按自己的节奏完成它"),
+            _short_text(raw.get("adventure_action"), 150, "多留一点时间，做得更完整"),
+        ],
+        "prompt": _short_text(raw.get("prompt"), 80, "做完之后，你想记住什么？"),
+    }
+
+
+def _persist_ai_tasks(conn: Any, raw_tasks: list[dict], intent: str, minutes: int) -> list[dict]:
+    existing = {
+        _short_text(row["title"], 60, "").lower()
+        for row in conn.execute("SELECT title FROM tasks").fetchall()
+    }
+    saved = []
+    for raw in raw_tasks:
+        if not isinstance(raw, dict):
+            continue
+        task = _clean_ai_task(raw, intent, minutes)
+        title_key = task["title"].lower()
+        if title_key in existing:
+            continue
+        slug = f"ai-{uuid.uuid4().hex[:12]}"
+        conn.execute(
+            """
+            INSERT INTO tasks (
+                slug, title, summary, category, tags,
+                minutes_min, minutes_standard, minutes_adventure,
+                social, place, cost, difficulty, color,
+                min_action, standard_action, adventure_action, prompt, is_custom, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+            """,
+            (
+                slug,
+                task["title"],
+                task["summary"],
+                task["category"],
+                json.dumps(task["tags"], ensure_ascii=False),
+                *task["minutes"],
+                task["social"],
+                task["place"],
+                task["cost"],
+                task["difficulty"],
+                task["color"],
+                *task["actions"],
+                task["prompt"],
+                now_iso(),
+            ),
+        )
+        existing.add(title_key)
+        row = conn.execute("SELECT * FROM tasks WHERE slug = ?", (slug,)).fetchone()
+        serialized = serialize_task(row)
+        serialized["reason"] = "这是 AI 为此刻想到的一件小事。你可以按自己的方式完成。"
+        saved.append(serialized)
+    conn.commit()
+    return saved
+
+
+def _fallback_ai_tasks(conn: Any, intent: str, energy: int, count: int) -> list[dict]:
+    active = _active(conn)
+    exclude_ids = {active["task"]["id"]} if active else set()
+    try:
+        return recommend(
+            conn,
+            intent=intent,
+            energy=energy,
+            limit=count,
+            exclude_ids=exclude_ids,
+            seed=int(time.time() * 1000),
+        )
+    except Exception:
+        logger.exception("精选小事回退失败")
+        return []
+
+
+@app.post("/api/ai-inspiration")
+def ai_inspiration(payload: AIInspirationRequest) -> dict:
+    valid_intents = {item["id"] for item in INTENTS}
+    intent = payload.intent if payload.intent in valid_intents else ""
+    energy = max(1, min(5, payload.energy))
+    minutes = max(1, min(180, payload.minutes))
+    count = max(1, min(5, payload.count))
+    conn = connect()
+    try:
+        if OPENAI_API_KEY:
+            try:
+                existing_titles = [
+                    _short_text(row["title"], 60, "")
+                    for row in conn.execute("SELECT title FROM tasks ORDER BY id").fetchall()
+                ]
+                generated = _generate_ai_batch(
+                    intent=intent,
+                    energy=energy,
+                    minutes=minutes,
+                    count=count,
+                    existing_titles=existing_titles,
+                    liked_categories=_ai_liked_categories(conn),
+                )
+                saved = _persist_ai_tasks(conn, generated, intent, minutes)
+                if saved:
+                    return {"tasks": saved[:count], "mode": "ai"}
+            except Exception:
+                logger.exception("AI 灵感生成失败")
+            tasks = _fallback_ai_tasks(conn, intent, energy, count)
+            return {
+                "tasks": tasks,
+                "mode": "curated",
+                "notice": "AI 这次没有接上，先从精选小事里挑给你。",
+            }
+        tasks = _fallback_ai_tasks(conn, intent, energy, count)
+        return {
+            "tasks": tasks,
+            "mode": "curated",
+            "notice": "AI 灵感还没配置 OPENAI_API_KEY，先给你挑了几件精选小事。",
+        }
+    finally:
+        conn.close()
 
 @app.get("/api/memories")
 def memories(limit: int = Query(default=200, ge=1, le=500)) -> dict:

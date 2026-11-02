@@ -9,6 +9,13 @@ const ENERGY_OPTIONS = [
   { value: 3, label: "一般" },
   { value: 4, label: "还行" },
 ];
+const AI_INTENT_OPTIONS = [
+  { id: "quiet", label: "安静一点" },
+  { id: "distract", label: "换换脑子" },
+  { id: "achieve", label: "一点成就" },
+  { id: "outside", label: "出去透口气" },
+];
+const AI_MINUTE_OPTIONS = [5, 10, 30];
 const COLORS = ["#D8A47F", "#B8C6B0", "#A9C4D4", "#D6A5A0", "#C7A5A0", "#A8ADA4"];
 const CATEGORY_OPTIONS = ["自定义", "安静", "身体", "创造", "观察", "城市", "连接", "照顾", "勇气"];
 
@@ -294,10 +301,10 @@ function renderTodayView() {
     <section class="home-grid">
       <div class="hero">
         <div class="eyebrow">${greeting()} · 第 ${days} 天</div>
-        <h1>今天，<br /><em>不用过得很好。</em></h1>
-        <p class="hero-sub">从一件愿意做的小事开始。做完之后，把它留在这里；不需要照片，也不需要一段漂亮的总结。</p>
+        <h1>今天，<br /><em>慢一点也没关系。</em></h1>
+        <p class="hero-sub">不用完成什么。只挑一件让心里松一点的小事。</p>
         <div class="hero-foot">
-          <p class="hero-note">你不需要把每一件都做完。一百只是一个容器，用来装下一些本来会被忘记的日子。</p>
+          <p class="hero-note">一百只是一个容器，用来装下一些本来会被忘记的日子。</p>
           <span class="hero-manifesto">先和自己待一会儿</span>
         </div>
       </div>
@@ -316,11 +323,11 @@ function renderTodayView() {
 
     ${active ? renderActiveCard(active) : ""}
 
-    <section class="section">
+    <section class="section section-intent">
       <div class="section-head">
         <div>
-          <h2>此刻，你想怎么和自己待一会儿？</h2>
-          <p>选一个接近现在的状态就好，不用选“应该”的那个。</p>
+          <h2>此刻，我想</h2>
+          <p>选一个接近现在的状态就好。</p>
         </div>
         <button class="text-button" type="button" data-action="open-browse">全部小事 →</button>
       </div>
@@ -337,15 +344,15 @@ function renderTodayView() {
               </button>`,
           ).join("")}
         </div>
-        <span class="energy-note">电量低时，我们会只给最小版本。</span>
+        <span class="energy-note">电量低时，只给最小版本。</span>
       </div>
     </section>
 
-    <section class="section">
+    <section class="section section-tasks">
       <div class="section-head">
         <div>
-          <h2>${state.intent ? "这几件，可能适合现在" : "从这几件开始"}</h2>
-          <p>${state.intent ? "推荐只是一个方向，不喜欢就换一个。" : "第一次由你来选，后面再慢慢认识彼此。"}</p>
+          <h2>${state.intent ? "为你挑的一件小事" : "从一件小事开始"}</h2>
+          <p>${state.intent ? "不喜欢就换一个，不用勉强。" : "第一次由你来选，后面再慢慢认识彼此。"}</p>
         </div>
         <button class="text-button" type="button" data-action="refresh-suggestions" ${state.loadingSuggestions ? "disabled" : ""}>${state.loadingSuggestions ? "正在换…" : "换一组"}</button>
       </div>
@@ -356,7 +363,7 @@ function renderTodayView() {
       </div>
     </section>
 
-    <section class="section">
+    <section class="section home-memories">
       <div class="section-head">
         <div>
           <h2>被留下的日子</h2>
@@ -372,9 +379,7 @@ function renderIntent(intent) {
   const active = state.intent === intent.id;
   return `
     <button class="intent-card ${active ? "active" : ""}" type="button" data-action="intent" data-id="${intent.id}" aria-pressed="${active}">
-      <span class="intent-emoji" aria-hidden="true">${intent.emoji}</span>
       <span class="intent-label">${escapeHtml(intent.label)}</span>
-      <span class="intent-short">${escapeHtml(intent.short)}</span>
     </button>`;
 }
 
@@ -414,12 +419,17 @@ function renderTaskGrid(tasks) {
 
 function renderTaskCard(task) {
   const version = task.suggested_version || "standard";
+  const sourceLabel = task.source === "ai" ? "AI 灵感" : VERSION_LABELS[version];
   return `
     <article class="task-card" style="--task-color:${escapeAttr(task.color)}">
-      <span class="task-wash" aria-hidden="true"></span>
+      <div class="task-art" aria-hidden="true">
+        <span class="task-art-window"></span>
+        <span class="task-art-sun"></span>
+        <span class="task-art-hill"></span>
+      </div>
       <div class="task-kicker">
         <span>${escapeHtml(task.category)}</span>
-        <span>${escapeHtml(VERSION_LABELS[version])}</span>
+        <span>${escapeHtml(sourceLabel)}</span>
       </div>
       <h3 class="task-title">${escapeHtml(task.title)}</h3>
       <p class="task-summary">${escapeHtml(task.summary)}</p>
@@ -429,7 +439,7 @@ function renderTaskCard(task) {
           <span>约 ${timeOf(task, version)} 分钟</span>
           <span>${task.cost ? "花一点钱" : "不花钱"}</span>
         </div>
-        <button class="task-action" type="button" data-action="open-task" data-task-id="${task.id}" data-version="${version}">看看</button>
+        <button class="task-action" type="button" data-action="open-task" data-task-id="${task.id}" data-version="${version}">看看这件小事</button>
       </div>
     </article>`;
 }
@@ -633,6 +643,7 @@ function renderSheet() {
   document.body.classList.add("sheet-open");
   let content = "";
   if (state.sheet.type === "task") content = renderTaskSheet();
+  if (state.sheet.type === "ai") content = renderAISheet();
   if (state.sheet.type === "browse") content = renderBrowseSheet();
   if (state.sheet.type === "custom") content = renderCustomSheet();
   if (state.sheet.type === "complete") content = renderCompleteSheet();
@@ -682,10 +693,102 @@ function renderTaskSheet() {
             </button>`).join("")}
         </div>
         <p class="safety-note">做之前不用准备得完美。累了就选最小版，今天先不做也算照顾自己。</p>
+        <button class="ai-entry" type="button" data-action="open-ai">
+          <span class="ai-entry-mark" aria-hidden="true">AI</span>
+          <span class="ai-entry-copy">
+            <strong>AI 灵感</strong>
+            <small>都不太想？让我再想一个</small>
+          </span>
+          <span class="ai-entry-arrow" aria-hidden="true">→</span>
+        </button>
       </div>
       <div class="sheet-footer">
         <span class="sheet-footer-note">选择后，它会安静地出现在你的今天里。</span>
         <button class="primary-button" type="button" data-action="confirm-select">就是这件</button>
+      </div>
+    </section>`;
+}
+
+function renderAISheet() {
+  const sheet = state.sheet;
+  if (sheet.aiStep === "result" && sheet.tasks?.length) {
+    const task = sheet.tasks[sheet.index] || sheet.tasks[0];
+    const version = sheet.version || "standard";
+    const sourceText = sheet.mode === "ai" ? "AI 现想的" : "精选小事";
+    return `
+      <section class="sheet" role="dialog" aria-modal="true" aria-label="AI 灵感">
+        ${renderSheetHead("AI 灵感", "先看看这一件")}
+        <div class="sheet-body">
+          <article class="ai-result-card" style="--task-color:${escapeAttr(task.color)}">
+            <div class="task-art ai-result-art" aria-hidden="true">
+              <span class="task-art-window"></span>
+              <span class="task-art-sun"></span>
+              <span class="task-art-hill"></span>
+            </div>
+            <div class="ai-result-body">
+              <div class="ai-result-topline">
+                <span class="ai-result-badge">${sourceText}</span>
+                <span>${sheet.index + 1} / ${sheet.tasks.length}</span>
+              </div>
+              <h3>${escapeHtml(task.title)}</h3>
+              <p class="ai-result-summary">${escapeHtml(task.summary)}</p>
+              <p class="ai-result-action">${escapeHtml(task.versions[version])}</p>
+              <div class="ai-result-meta">
+                <span>约 ${timeOf(task, version)} 分钟</span>
+                <span>${task.cost ? "可以花一点钱" : "不花钱"}</span>
+                <span>${socialLabel(task)}</span>
+              </div>
+            </div>
+          </article>
+          ${sheet.mode !== "ai" ? `<p class="ai-fallback-note">AI 暂时还没接上，这次先从精选小事里挑给你。</p>` : ""}
+        </div>
+        <div class="sheet-footer ai-result-footer">
+          <button class="secondary-button" type="button" data-action="cycle-ai" ${sheet.tasks.length < 2 ? "disabled" : ""}>换一个</button>
+          <button class="primary-button" type="button" data-action="choose-ai">就是这件</button>
+        </div>
+      </section>`;
+  }
+
+  const intent = sheet.intent || state.intent || "quiet";
+  const minutes = sheet.minutes || 10;
+  const energy = sheet.energy || state.energy;
+  return `
+    <section class="sheet" role="dialog" aria-modal="true" aria-label="AI 灵感">
+      ${renderSheetHead("AI 灵感", "先告诉我一点现在的你")}
+      <div class="sheet-body">
+        <p class="detail-summary">不用想得很清楚。给我两个小线索，我替你把选择缩小到三件。</p>
+        <div class="ai-field">
+          <span class="ai-field-label">此刻更想</span>
+          <div class="ai-options">
+            ${AI_INTENT_OPTIONS.map((option) => `
+              <button class="ai-option ${intent === option.id ? "active" : ""}" type="button" data-action="ai-option" data-key="intent" data-value="${option.id}">
+                ${option.label}
+              </button>`).join("")}
+          </div>
+        </div>
+        <div class="ai-field">
+          <span class="ai-field-label">可以留多久</span>
+          <div class="ai-options">
+            ${AI_MINUTE_OPTIONS.map((value) => `
+              <button class="ai-option ${minutes === value ? "active" : ""}" type="button" data-action="ai-option" data-key="minutes" data-value="${value}">
+                ${value} 分钟
+              </button>`).join("")}
+          </div>
+        </div>
+        <div class="ai-field">
+          <span class="ai-field-label">今天的电量</span>
+          <div class="ai-options">
+            ${ENERGY_OPTIONS.map((option) => `
+              <button class="ai-option ${energy === option.value ? "active" : ""}" type="button" data-action="ai-option" data-key="energy" data-value="${option.value}">
+                ${option.label}
+              </button>`).join("")}
+          </div>
+        </div>
+        <p class="safety-note">只会给出真实、低压力、可以随时停下来的小事。不会要求你表现得更积极。</p>
+      </div>
+      <div class="sheet-footer">
+        <span class="sheet-footer-note">三件候选，还是一次只看一件。</span>
+        <button class="primary-button" type="button" data-action="generate-ai" ${sheet.loading ? "disabled" : ""}>${sheet.loading ? "正在想…" : "帮我找 3 件"}</button>
       </div>
     </section>`;
 }
@@ -955,6 +1058,90 @@ async function loadBrowse(refresh) {
     state.browseLoading = false;
     if (state.sheet?.type === "browse") renderSheet();
   }
+}
+
+function openAI() {
+  state.sheet = {
+    type: "ai",
+    aiStep: "options",
+    intent: state.intent || "quiet",
+    minutes: 10,
+    energy: state.energy,
+    loading: false,
+    tasks: [],
+    index: 0,
+    mode: "ai",
+  };
+  renderSheet();
+}
+
+function setAIOption(key, value) {
+  if (state.sheet?.type !== "ai") return;
+  if (!["intent", "minutes", "energy"].includes(key)) return;
+  state.sheet[key] = key === "intent" ? value : Number(value);
+  renderSheet();
+}
+
+async function generateAI(button) {
+  const sheet = state.sheet;
+  if (!sheet || sheet.type !== "ai" || sheet.loading) return;
+  sheet.loading = true;
+  if (button) {
+    button.disabled = true;
+    button.textContent = "正在想…";
+  }
+  renderSheet();
+  try {
+    const data = await api("/api/ai-inspiration", {
+      method: "POST",
+      body: JSON.stringify({
+        intent: sheet.intent || state.intent || "",
+        energy: Number(sheet.energy || state.energy),
+        minutes: Number(sheet.minutes || 10),
+        count: 3,
+      }),
+    });
+    const tasks = data.tasks || [];
+    if (!tasks.length) throw new Error("刚才没有找到合适的小事，再试一次吧。");
+    state.sheet = {
+      ...sheet,
+      aiStep: "result",
+      tasks,
+      index: 0,
+      mode: data.mode || "curated",
+      version: "standard",
+      loading: false,
+    };
+    renderSheet();
+    if (data.notice) showToast(data.notice);
+  } catch (error) {
+    state.sheet = { ...sheet, loading: false };
+    renderSheet();
+    showToast(error.message);
+  }
+}
+
+function cycleAI() {
+  const sheet = state.sheet;
+  if (!sheet || sheet.type !== "ai" || sheet.aiStep !== "result" || !sheet.tasks?.length) return;
+  sheet.index = (sheet.index + 1) % sheet.tasks.length;
+  renderSheet();
+}
+
+function chooseAI() {
+  const sheet = state.sheet;
+  if (!sheet || sheet.type !== "ai" || sheet.aiStep !== "result" || !sheet.tasks?.length) return;
+  const task = sheet.tasks[sheet.index] || sheet.tasks[0];
+  state.sheet = {
+    type: "task",
+    task,
+    version: sheet.version || "standard",
+    intent: sheet.intent || state.intent,
+    reason: sheet.mode === "ai"
+      ? "这是 AI 为此刻想到的一件小事。你可以按自己的方式完成，也可以再换一个。"
+      : "这是从精选小事里挑出来的一件。按你的方式完成它就好。",
+  };
+  renderSheet();
 }
 
 function openCustom() {
@@ -1269,6 +1456,26 @@ document.addEventListener("click", async (event) => {
       reason: actionTarget.dataset.reason,
       intent: actionTarget.dataset.intent,
     });
+    return;
+  }
+  if (action === "open-ai") {
+    openAI();
+    return;
+  }
+  if (action === "ai-option") {
+    setAIOption(actionTarget.dataset.key, actionTarget.dataset.value);
+    return;
+  }
+  if (action === "generate-ai") {
+    await generateAI(actionTarget);
+    return;
+  }
+  if (action === "cycle-ai") {
+    cycleAI();
+    return;
+  }
+  if (action === "choose-ai") {
+    chooseAI();
     return;
   }
   if (action === "open-browse") {

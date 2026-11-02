@@ -270,9 +270,17 @@ def _seed_tasks(connection: Any) -> None:
 
 
 def serialize_task(row: Any) -> dict:
+    slug = row["slug"] or ""
+    if slug.startswith("ai-"):
+        source = "ai"
+    elif row["is_custom"]:
+        source = "custom"
+    else:
+        source = "curated"
     return {
         "id": row["id"],
         "slug": row["slug"],
+        "source": source,
         "title": row["title"],
         "summary": row["summary"],
         "category": row["category"],

@@ -10,6 +10,7 @@
 - 六种当下意图、三档电量，低电量优先推荐短时低难度任务
 - 自选第一件事、完成记录、照片、文字、余温、颜色、私密标记
 - 根据意图、电量、正向反馈、主题分布和跳过历史进行规则推荐
+- 「AI 灵感」按当下意图、电量和可用时间生成 3 件候选；未配置 Key 时自动回退到精选小事
 - 记忆墙、单条记忆详情、自定义任务
 - 可修改目标数量和可用时长，历史记录不会被删除
 - 照片在浏览器端压缩，服务端再次校正方向并移除 EXIF
@@ -86,6 +87,9 @@ BLOB_READ_WRITE_TOKEN
 | `BLOB_READ_WRITE_TOKEN` | 上传照片必须 | Vercel Blob 写入令牌 |
 | `APP_PASSWORD` | 线上必须 | 你的访问密码，建议至少 16 位且不要复用 |
 | `SESSION_SECRET` | 强烈建议 | 登录 Cookie 签名密钥，可用 `openssl rand -hex 32` 生成 |
+| `OPENAI_API_KEY` | 可选 | 用于「AI 灵感」生成；未配置时自动使用精选小事 |
+| `OPENAI_BASE_URL` | 可选 | 默认 `https://api.siliconflow.cn/v1`，使用硅基流动的 OpenAI 兼容接口 |
+| `OPENAI_MODEL` | 可选 | 默认 `deepseek-ai/DeepSeek-V4-Flash` |
 
 线上即使忘记设置 `APP_PASSWORD`，应用也不会把数据公开，而是会锁定在登录页并提示配置缺失。
 
@@ -107,6 +111,7 @@ https://你的域名/api/health
   "tasks": 48,
   "storage": "postgres",
   "blob": true,
+  "ai": true,
   "auth_required": true,
   "auth_configured": true
 }
@@ -155,6 +160,7 @@ yibai-mvp/
 | `POST /api/login` / `POST /api/logout` | 登录与退出 |
 | `GET /api/bootstrap` | 首页数据、当前任务、统计和建议 |
 | `GET /api/tasks` | 获取候选任务，支持换一组 |
+| `POST /api/ai-inspiration` | 按意图、电量和可用时间生成 3 件 AI 候选 |
 | `POST /api/select` | 选定任务和版本 |
 | `POST /api/complete` | 保存完成记录、照片、反馈和下一组推荐 |
 | `POST /api/skip/:id` | 这次先不做 |

@@ -79,7 +79,7 @@ BLOB_STORE_ID
 
 如果环境变量页面底部有 **Enable access to System Environment Variables**，请保持勾选，否则运行时拿不到 `VERCEL_OIDC_TOKEN`。
 
-没有 Blob 时，文字记录仍可保存，但上传照片会返回配置错误。
+Blob 是可选的。没有 Blob 时，线上照片会自动存进 Postgres（`photos` 表），本地开发则存到 `media/`。这样即使 Blob 配额或认证出问题，照片也不会丢。
 
 ### 3. 设置环境变量
 
@@ -88,8 +88,8 @@ BLOB_STORE_ID
 | 变量 | 是否必须 | 说明 |
 | --- | --- | --- |
 | `DATABASE_URL` | 线上必须 | Neon/Postgres 连接串，也可使用 `POSTGRES_URL` |
-| `BLOB_STORE_ID` | 新版 Blob 自动注入 | Vercel Blob Store ID，配合 `VERCEL_OIDC_TOKEN` 使用 |
-| `BLOB_READ_WRITE_TOKEN` | 旧版 Blob 使用 | 旧版 Vercel Blob 写入令牌；新版不需要 |
+| `BLOB_STORE_ID` | 可选 | 新版 Blob 自动注入；没有 Blob 时照片存 Postgres |
+| `BLOB_READ_WRITE_TOKEN` | 可选 | 旧版 Vercel Blob 写入令牌；新版不需要 |
 | `APP_PASSWORD` | 线上必须 | 你的访问密码，建议至少 16 位且不要复用 |
 | `SESSION_SECRET` | 强烈建议 | 登录 Cookie 签名密钥，可用 `openssl rand -hex 32` 生成 |
 | `OPENAI_API_KEY` | 可选 | 用于「AI 灵感」生成；未配置时自动使用精选小事 |
@@ -115,8 +115,9 @@ https://你的域名/api/health
   "ok": true,
   "tasks": 48,
   "storage": "postgres",
-  "blob": true,
-  "blob_mode": "oidc",
+  "blob": false,
+  "blob_mode": "none",
+  "photo_storage": "postgres",
   "ai": true,
   "auth_required": true,
   "auth_configured": true
@@ -126,8 +127,8 @@ https://你的域名/api/health
 重点检查：
 
 - `storage` 是 `postgres`
-- `blob` 是 `true`
-- `blob_mode` 是 `oidc`（旧版 Token 会显示 `token`）
+- `photo_storage` 是 `postgres` 或 `blob`
+- 如果配置了 Blob，`blob` 是 `true`，`blob_mode` 是 `oidc` 或 `token`
 - `auth_configured` 是 `true`
 
 然后打开首页，输入 `APP_PASSWORD` 登录。

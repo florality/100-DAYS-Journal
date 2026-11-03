@@ -342,6 +342,7 @@ def health(response: Response) -> dict:
         "storage": "postgres" if using_postgres() else ("unconfigured" if IS_VERCEL else "sqlite"),
         "blob": _blob_mode() != "none",
         "blob_mode": _blob_mode(),
+        "photo_storage": "blob" if _blob_mode() != "none" else ("postgres" if using_postgres() else "local"),
         "ai": bool(OPENAI_API_KEY),
         "auth_required": AUTH_REQUIRED,
         "auth_configured": bool(APP_PASSWORD) if AUTH_REQUIRED else True,
@@ -399,6 +400,8 @@ def _active(conn: Any) -> Optional[dict]:
 def _photo_url(photo_path: Optional[str]) -> Optional[str]:
     if not photo_path:
         return None
+    if photo_path.startswith("db:"):
+        return f"/api/photos/{photo_path[3:]}"
     if photo_path.startswith(("http://", "https://")):
         return photo_path
     return f"/media/{photo_path}"
@@ -1076,6 +1079,30 @@ def ai_inspiration(payload: AIInspirationRequest) -> dict:
     finally:
         conn.close()
 
+
+@app.get("/api/photos/{photo_id}")
+def get_photo(photo_id: str) -> Response:
+    if len(photo_id) != 32 or any(char not in "0123456789abcdef" for char in photo_id):
+        raise HTTPException(status_code=404, detail="照片不存在")
+    conn = connect()
+    try:
+        row = conn.execute(
+            "SELECT content_type, data FROM photos WHERE id = ?", (photo_id,)
+        ).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="照片不存在")
+    data = row["data"]
+    if isinstance(data, memoryview):
+        data = data.tobytes()
+    return Response(
+        content=bytes(data),
+        media_type=row["content_type"],
+        headers={"Cache-Control": "private, max-age=31536000, immutable"},
+    )
+
+
 @app.get("/api/memories")
 def memories(limit: int = Query(default=200, ge=1, le=500)) -> dict:
     conn = connect()
@@ -1143,10 +1170,17 @@ def reset_demo() -> dict:
             for row in photo_rows
             if str(row["photo_path"]).startswith(("http://", "https://"))
         ]
+        db_photo_ids = [
+            str(row["photo_path"])[3:]
+            for row in photo_rows
+            if str(row["photo_path"]).startswith("db:")
+        ]
         conn.execute("DELETE FROM entries")
         conn.execute("DELETE FROM user_tasks")
         conn.execute("DELETE FROM checkins")
         conn.execute("DELETE FROM tasks WHERE is_custom = 1")
+        for photo_id in db_photo_ids:
+            conn.execute("DELETE FROM photos WHERE id = ?", (photo_id,))
         conn.execute(
             "UPDATE profile SET name = '你', target_count = 100, duration_days = 365 WHERE id = 1"
         )
@@ -1162,6 +1196,20 @@ def reset_demo() -> dict:
         return {"ok": True}
     finally:
         conn.close()
+
+
+def _save_photo_to_db(data: bytes) -> str:
+    photo_id = uuid.uuid4().hex
+    conn = connect()
+    try:
+        conn.execute(
+            "INSERT INTO photos (id, content_type, data, created_at) VALUES (?, ?, ?, ?)",
+            (photo_id, "image/jpeg", data, now_iso()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return f"db:{photo_id}"
 
 
 def _save_photo(data_url: str) -> str:
@@ -1189,16 +1237,24 @@ def _save_photo(data_url: str) -> str:
     except Exception as exc:
         raise HTTPException(status_code=400, detail="这张图片暂时无法处理，请换一张试试") from exc
 
+    photo_bytes = output.getvalue()
     if _blob_mode() != "none":
-        return _upload_to_blob(output.getvalue())
+        try:
+            return _upload_to_blob(photo_bytes)
+        except HTTPException:
+            if IS_VERCEL and not using_postgres():
+                raise
+            logger.warning("Blob upload failed; falling back to database or local storage")
+    if using_postgres():
+        return _save_photo_to_db(photo_bytes)
     if IS_VERCEL:
         raise HTTPException(
             status_code=500,
-            detail="图片存储未配置：请在 Vercel 项目里连接 Blob，并启用 System Environment Variables（需要 BLOB_STORE_ID 和 VERCEL_OIDC_TOKEN）。",
+            detail="图片存储未配置：请先连接 Postgres 或 Blob。",
         )
     MEDIA_DIR.mkdir(parents=True, exist_ok=True)
     filename = f"{uuid.uuid4().hex}.jpg"
-    (MEDIA_DIR / filename).write_bytes(output.getvalue())
+    (MEDIA_DIR / filename).write_bytes(photo_bytes)
     return filename
 
 

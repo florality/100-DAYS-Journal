@@ -132,6 +132,13 @@ CREATE TABLE IF NOT EXISTS checkins (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS photos (
+    id TEXT PRIMARY KEY,
+    content_type TEXT NOT NULL,
+    data BLOB NOT NULL,
+    created_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_user_tasks_status ON user_tasks(status);
 CREATE INDEX IF NOT EXISTS idx_entries_created ON entries(created_at);
 """
@@ -200,6 +207,14 @@ POSTGRES_SCHEMA = [
         id BIGSERIAL PRIMARY KEY,
         intent TEXT NOT NULL,
         energy INTEGER,
+        created_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS photos (
+        id TEXT PRIMARY KEY,
+        content_type TEXT NOT NULL,
+        data BYTEA NOT NULL,
         created_at TEXT NOT NULL
     )
     """,

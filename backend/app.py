@@ -38,6 +38,8 @@ from .recommender import INTENTS, recommend
 STATIC_DIR = PUBLIC_DIR / "static"
 MAX_PHOTO_BYTES = 3 * 1024 * 1024
 BLOB_TOKEN = os.getenv("BLOB_READ_WRITE_TOKEN", "").strip()
+BLOB_STORE_ID = os.getenv("BLOB_STORE_ID", "").strip()
+VERCEL_OIDC_TOKEN = os.getenv("VERCEL_OIDC_TOKEN", "").strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_BASE_URL = (
     os.getenv("OPENAI_BASE_URL", "https://api.siliconflow.cn/v1").strip().rstrip("/")
@@ -57,6 +59,50 @@ PUBLIC_API_PATHS = {"/api/health", "/api/session", "/api/login", "/api/logout"}
 STARTUP_ERROR: Optional[str] = None
 
 logger = logging.getLogger("yibai")
+
+
+def _blob_mode() -> str:
+    if BLOB_TOKEN:
+        return "token"
+    if BLOB_STORE_ID and _oidc_token():
+        return "oidc"
+    return "none"
+
+
+def _oidc_token() -> str:
+    return os.getenv("VERCEL_OIDC_TOKEN", "").strip() or VERCEL_OIDC_TOKEN
+
+
+def _blob_headers(content_type: Optional[str] = None, write: bool = False) -> dict[str, str]:
+    if _blob_mode() == "token":
+        headers = {
+            "Authorization": f"Bearer {BLOB_TOKEN}",
+            "x-api-version": "7",
+        }
+    else:
+        headers = {
+            "Authorization": f"Bearer {_oidc_token()}",
+            "x-vercel-blob-store-id": BLOB_STORE_ID,
+            "x-vercel-blob-access": "public",
+        }
+    if content_type:
+        headers["x-content-type"] = content_type
+    if write:
+        headers["x-add-random-suffix"] = "1"
+        headers["x-cache-control-max-age"] = "31536000"
+    return headers
+
+
+def _blob_upload_bases() -> list[str]:
+    if _blob_mode() == "token":
+        return ["https://blob.vercel-storage.com"]
+    return ["https://vercel.com/api/blob", "https://blob.vercel-storage.com"]
+
+
+def _blob_delete_url() -> str:
+    if _blob_mode() == "token":
+        return "https://blob.vercel-storage.com/delete"
+    return "https://vercel.com/api/blob/delete"
 
 if not IS_VERCEL:
     MEDIA_DIR.mkdir(parents=True, exist_ok=True)
@@ -294,7 +340,8 @@ def health(response: Response) -> dict:
     result = {
         "ok": True,
         "storage": "postgres" if using_postgres() else ("unconfigured" if IS_VERCEL else "sqlite"),
-        "blob": bool(BLOB_TOKEN),
+        "blob": _blob_mode() != "none",
+        "blob_mode": _blob_mode(),
         "ai": bool(OPENAI_API_KEY),
         "auth_required": AUTH_REQUIRED,
         "auth_configured": bool(APP_PASSWORD) if AUTH_REQUIRED else True,
@@ -1142,12 +1189,12 @@ def _save_photo(data_url: str) -> str:
     except Exception as exc:
         raise HTTPException(status_code=400, detail="这张图片暂时无法处理，请换一张试试") from exc
 
-    if BLOB_TOKEN:
+    if _blob_mode() != "none":
         return _upload_to_blob(output.getvalue())
     if IS_VERCEL:
         raise HTTPException(
             status_code=500,
-            detail="图片存储未配置：请在 Vercel 项目里连接 Blob，并注入 BLOB_READ_WRITE_TOKEN。",
+            detail="图片存储未配置：请在 Vercel 项目里连接 Blob，并启用 System Environment Variables（需要 BLOB_STORE_ID 和 VERCEL_OIDC_TOKEN）。",
         )
     MEDIA_DIR.mkdir(parents=True, exist_ok=True)
     filename = f"{uuid.uuid4().hex}.jpg"
@@ -1156,17 +1203,13 @@ def _save_photo(data_url: str) -> str:
 
 
 def _delete_blobs(urls: list[str]) -> None:
-    if not BLOB_TOKEN:
+    if _blob_mode() == "none":
         return
     request = urllib.request.Request(
-        "https://blob.vercel-storage.com/delete",
+        _blob_delete_url(),
         data=json.dumps({"urls": urls}).encode("utf-8"),
         method="POST",
-        headers={
-            "Authorization": f"Bearer {BLOB_TOKEN}",
-            "Content-Type": "application/json",
-            "x-api-version": "7",
-        },
+        headers={**_blob_headers(), "Content-Type": "application/json"},
     )
     try:
         with urllib.request.urlopen(request, timeout=15):
@@ -1177,26 +1220,37 @@ def _delete_blobs(urls: list[str]) -> None:
 
 def _upload_to_blob(data: bytes) -> str:
     pathname = f"yibai/{uuid.uuid4().hex}.jpg"
-    request = urllib.request.Request(
-        f"https://blob.vercel-storage.com/{pathname}",
-        data=data,
-        method="PUT",
-        headers={
-            "Authorization": f"Bearer {BLOB_TOKEN}",
-            "x-content-type": "image/jpeg",
-            "x-add-random-suffix": "1",
-            "x-cache-control-max-age": "31536000",
-            "x-api-version": "7",
-        },
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=25) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-    except Exception as exc:
+    payload: dict[str, Any] = {}
+    last_error: Optional[Exception] = None
+    for base in _blob_upload_bases():
+        headers = _blob_headers(content_type="image/jpeg", write=True)
+        if base == "https://blob.vercel-storage.com" and _blob_mode() == "oidc":
+            headers["x-api-version"] = "7"
+        request = urllib.request.Request(
+            f"{base}/{pathname}",
+            data=data,
+            method="PUT",
+            headers=headers,
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=25) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            break
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", "replace")[:400]
+            logger.warning("Blob upload failed (%s %s): %s", exc.code, base, body)
+            last_error = exc
+            if exc.code not in {401, 403, 404, 405, 422}:
+                break
+        except Exception as exc:
+            logger.warning("Blob upload failed (%s): %s", base, exc)
+            last_error = exc
+            break
+    if not payload:
         raise HTTPException(
             status_code=502,
             detail="照片暂时没能上传到 Blob，请稍后再试。",
-        ) from exc
+        ) from last_error
     url = payload.get("url")
     if not url:
         raise HTTPException(status_code=502, detail="Blob 没有返回图片地址，请稍后再试。")

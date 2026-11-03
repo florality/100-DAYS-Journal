@@ -69,11 +69,15 @@ POSTGRES_URL
 
 ### 2. 连接 Vercel Blob
 
-在 **Storage** 中创建一个 Blob Store，并连接到当前项目。连接后应自动注入：
+在 **Storage** 中创建一个 Blob Store，并连接到当前项目。新版 Blob Store 使用 OIDC，连接后会自动注入：
 
 ```text
-BLOB_READ_WRITE_TOKEN
+BLOB_STORE_ID
 ```
+
+运行时 Vercel 还会自动提供短期的 `VERCEL_OIDC_TOKEN`。代码会优先使用 OIDC；如果使用的是旧版 Store，也可以继续配置 `BLOB_READ_WRITE_TOKEN`，两种方式都会自动识别。
+
+如果环境变量页面底部有 **Enable access to System Environment Variables**，请保持勾选，否则运行时拿不到 `VERCEL_OIDC_TOKEN`。
 
 没有 Blob 时，文字记录仍可保存，但上传照片会返回配置错误。
 
@@ -84,7 +88,8 @@ BLOB_READ_WRITE_TOKEN
 | 变量 | 是否必须 | 说明 |
 | --- | --- | --- |
 | `DATABASE_URL` | 线上必须 | Neon/Postgres 连接串，也可使用 `POSTGRES_URL` |
-| `BLOB_READ_WRITE_TOKEN` | 上传照片必须 | Vercel Blob 写入令牌 |
+| `BLOB_STORE_ID` | 新版 Blob 自动注入 | Vercel Blob Store ID，配合 `VERCEL_OIDC_TOKEN` 使用 |
+| `BLOB_READ_WRITE_TOKEN` | 旧版 Blob 使用 | 旧版 Vercel Blob 写入令牌；新版不需要 |
 | `APP_PASSWORD` | 线上必须 | 你的访问密码，建议至少 16 位且不要复用 |
 | `SESSION_SECRET` | 强烈建议 | 登录 Cookie 签名密钥，可用 `openssl rand -hex 32` 生成 |
 | `OPENAI_API_KEY` | 可选 | 用于「AI 灵感」生成；未配置时自动使用精选小事 |
@@ -111,6 +116,7 @@ https://你的域名/api/health
   "tasks": 48,
   "storage": "postgres",
   "blob": true,
+  "blob_mode": "oidc",
   "ai": true,
   "auth_required": true,
   "auth_configured": true
@@ -121,6 +127,7 @@ https://你的域名/api/health
 
 - `storage` 是 `postgres`
 - `blob` 是 `true`
+- `blob_mode` 是 `oidc`（旧版 Token 会显示 `token`）
 - `auth_configured` 是 `true`
 
 然后打开首页，输入 `APP_PASSWORD` 登录。
@@ -181,7 +188,7 @@ yibai-mvp/
 
 **照片上传提示存储未配置**
 
-项目没有连接 Blob，或缺少 `BLOB_READ_WRITE_TOKEN`。连接 Blob Store 后重新部署。
+项目没有连接 Blob，或既没有 `BLOB_STORE_ID` + `VERCEL_OIDC_TOKEN`，也没有旧版的 `BLOB_READ_WRITE_TOKEN`。连接 Blob Store、勾选 System Environment Variables 后重新部署。
 
 **部署后还是本地数据**
 
